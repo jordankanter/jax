@@ -318,6 +318,10 @@ def lower_jaxpr_to_func(
   return body.func_op
 
 
+class MosaicLoweringException(Exception):
+  pass
+
+
 def jaxpr_subcomp(
     ctx: LoweringContext, jaxpr: jax_core.Jaxpr, *args: ir.Value
 ) -> Sequence[ir.Value]:
@@ -361,7 +365,21 @@ def jaxpr_subcomp(
             [v.aval for v in eqn.outvars],
             block_shapes,
         )
-        ans = lowering_rules[eqn.primitive](rule_context, *invals, **eqn.params)
+        try:
+          ans = lowering_rules[eqn.primitive](
+              rule_context, *invals, **eqn.params
+          )
+        except MosaicLoweringException:
+          raise  # We only add the extra info to the innermost exception.
+        except Exception as e:
+          raise MosaicLoweringException(
+              f"Exception while lowering eqn:\n  {eqn}\nWith context:\n "
+              f" {rule_context}\nWith inval"
+              f" shapes={map(lambda t: getattr(t, 'shape', None), invals)}\nWith"
+              " inval"
+              f" types={map(lambda t: getattr(t, 'type', None), invals)}\nIn"
+              f" jaxpr:\n{jaxpr}"
+          ) from e
       else:
         raise NotImplementedError(
             "Unimplemented primitive in Pallas TPU lowering: "
@@ -829,6 +847,10 @@ def _reshape_lowering_rule(ctx: LoweringRuleContext, x, new_sizes, dimensions):
     raise NotImplementedError
   if any(d is None for d in new_sizes):
     raise NotImplementedError
+  if isinstance(x, (np.ndarray, int, float)):
+    x = ir_constant(x)
+  if not ctx.avals_in[0].shape:
+    return vector.BroadcastOp(aval_to_ir_type(ctx.avals_out[0]), x).result
   return vector.ShapeCastOp(aval_to_ir_type(ctx.avals_out[0]), x).result
 
 
@@ -875,13 +897,13 @@ lowering_rules[lax.transpose_p] = _transpose_lowering_rule
 
 
 def _bcast(x, y, x_aval, y_aval, out_aval):
-  if isinstance(x, (np.ndarray, np.uint32, int, float)):
+  if isinstance(x, (np.ndarray, np.float32, np.uint32, int, float)):
     if hasattr(y, "type") and y.type == ir.IndexType.get():
       mlir_type = y.type
     else:
       mlir_type = mlir.dtype_to_ir_type(x_aval.dtype)
     x = ir_constant(x, mlir_type)
-  if isinstance(y, (np.ndarray, np.uint32, int, float)):
+  if isinstance(y, (np.ndarray, np.float32, np.uint32, int, float)):
     if hasattr(x, "type") and x.type == ir.IndexType.get():
       mlir_type = x.type
     else:
@@ -1013,10 +1035,21 @@ skip_mlir_conversions.add(lax.neg_p)
 
 
 def _rsqrt_lowering_rule(ctx: LoweringRuleContext, x):
+  if isinstance(x, (np.ndarray, float)):
+    x = ir_constant(x)
   return math.RsqrtOp(x).result
 
 
 lowering_rules[lax.rsqrt_p] = _rsqrt_lowering_rule
+
+
+def _sqrt_lowering_rule(ctx: LoweringRuleContext, x):
+  if isinstance(x, (np.ndarray, float)):
+    x = ir_constant(x)
+  return math.SqrtOp(x).result
+
+
+lowering_rules[lax.sqrt_p] = _sqrt_lowering_rule
 
 
 def _exp_lowering_rule(ctx: LoweringRuleContext, x):
@@ -1029,7 +1062,8 @@ lowering_rules[lax.exp_p] = _exp_lowering_rule
 def _pow_lowering_rule(ctx: LoweringRuleContext, x, y):
   if not isinstance(x, ir.Value) and x == 2.:
     return math.Exp2Op(y).result
-  raise NotImplementedError("Only 2^x supported")
+  x, y = _bcast(x, y, ctx.avals_in[0], ctx.avals_in[1], ctx.avals_out[0])
+  return math.PowFOp(x, y).result
 
 
 lowering_rules[lax.pow_p] = _pow_lowering_rule
@@ -1051,15 +1085,23 @@ def _logistic_lowering_rule(ctx: LoweringRuleContext, x):
   neg_x = arith.NegFOp(x).result
   exp_neg_x = math.ExpOp(neg_x).result
   aval_out = ctx.avals_out[0]
-  out_type = ir.VectorType.get(
-      aval_out.shape, mlir.dtype_to_ir_type(aval_out.dtype)
-  )
-  one = vector.BroadcastOp(out_type, ir_constant(1.0))
+  out_type = aval_to_ir_type(aval_out)
+  if aval_out.shape == ():
+    one = ir_constant(1.0, mlir_type=out_type)
+  else:
+    one = vector.BroadcastOp(out_type, ir_constant(1.0))
   denom = arith.AddFOp(one, exp_neg_x).result
   return arith.DivFOp(one, denom).result
 
 
 lowering_rules[lax.logistic_p] = _logistic_lowering_rule
+
+
+def _sin_lowering_rule(ctx: LoweringRuleContext, x):
+  return math.SinOp(x).result
+
+
+lowering_rules[lax.sin_p] = _sin_lowering_rule
 
 
 def _tanh_lowering_rule(ctx: LoweringRuleContext, x):
@@ -1148,6 +1190,43 @@ def _select_n_lowering_rule(ctx: LoweringRuleContext, pred, x, *args):
 
 lowering_rules[lax.select_n_p] = _select_n_lowering_rule
 
+
+def _clamp_lowering_rule(ctx: LoweringRuleContext, min, operand, max):
+  """Compute minimum_p(maximum_p(min, operand), max)."""
+  if isinstance(min, (np.ndarray, int, float)):
+    min = ir_constant(min, getattr(operand, "type", getattr(max, "type", None)))
+  if isinstance(operand, (np.ndarray, int, float)):
+    operand = ir_constant(operand, min.type)
+  if isinstance(max, (np.ndarray, int, float)):
+    max = ir_constant(max, min.type)
+
+  (min_aval, operand_aval, max_aval) = ctx.avals_in
+
+  res_ctx = ctx.replace(
+      avals_in=(min_aval, operand_aval), block_shapes=ctx.block_shapes[:2]
+  )
+  res = arith.SelectOp(
+      lower_fun(jnp.greater, multiple_results=False)(res_ctx, min, operand),
+      min,
+      operand,
+  ).result
+  return arith.SelectOp(
+      lower_fun(jnp.less, multiple_results=False)(
+          ctx.replace(
+              avals_in=(res_ctx.avals_out[0], max_aval),
+              block_shapes=(res_ctx.avals_out[0].shape, ctx.block_shapes[2]),
+          ),
+          res,
+          max,
+      ),
+      res,
+      max,
+  ).result
+
+
+lowering_rules[lax.clamp_p] = _clamp_lowering_rule
+
+
 def _for_lowering_rule(
     ctx: LoweringRuleContext,
     *args,
@@ -1162,6 +1241,9 @@ def _for_lowering_rule(
   ]
   jaxpr, () = state_discharge.discharge_state(
       jaxpr, (), should_discharge=[False, *should_discharge]
+  )
+  args = tuple(
+      arg if isinstance(arg, ir.Value) else ir_constant(arg) for arg in args
   )
   for i in range(nsteps):
     if reverse:
@@ -1246,30 +1328,71 @@ skip_mlir_conversions.add(lax.scan_p)
 
 
 def _cond_lowering_rule(ctx: LoweringRuleContext, *args, branches, linear):
-  del linear
-  if len(branches) > 2:
-    raise NotImplementedError
-  pred, *args = args
-  out_types = map(aval_to_ir_type, ctx.avals_out)
-  pred = arith.TruncIOp(
-      aval_to_ir_type(jax_core.ShapedArray((), jnp.bool_)), pred
-  ).result
-  # Specialize to singleton `if`s
-  singleton = len(out_types) == 1
-  if singleton:
-    out_types = out_types[0]
+  index, *args = args
+
+  # If an smem Ref is read in a cond, discharge_state modifies the cond to
+  # return the read ref. Simply using aval_to_ir_type(aval_out) results in a
+  # vmem type, so we explicitly handle the types of passed-through smem memref.
+  def is_smem(t):
+    return str(getattr(t, "memory_space", None)) == "#tpu.memory_space<smem>"
+
+  arg_is_smem_ref = [is_smem(arg.type) for arg in args]
+
+  out_types = []
+  for i, aval_out in enumerate(ctx.avals_out):
+    # For each branch, get the input(s) that are passed through directly as
+    # aval_out (or None if aval_out is not a passed-through input).
+    invar_idx = set(
+        b.jaxpr.invars.index(b.jaxpr.outvars[i])
+        if b.jaxpr.outvars[i] in b.jaxpr.invars
+        else None
+        for b in branches
+    )
+    out_type = aval_to_ir_type(aval_out)
+
+    # The set `invar_idx` will have size 1 if all of the branches pass the same
+    # input through as aval_out, or if none of the branches pass an input
+    # through as aval_out.
+    if len(invar_idx) == 1:
+      invar_idx = next(iter(invar_idx))
+      if invar_idx is not None and arg_is_smem_ref[invar_idx]:
+        out_type = args[invar_idx].type
+    out_types.append(out_type)
+
+  # TODO(b/300272065): Use `scf.IndexSwitchOp` instead of a cascade of if/else.
+
+  pred = _cmpi_lowering_types[lax.ne_p]
+  predicate = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), pred)
+  if isinstance(index, (int, np.ndarray)):
+    index = ir_constant(index)
+  pred = arith.CmpIOp(predicate, index, ir_constant(0, index.type)).result
+  # DO NOT SUBMIT why specialize to singletons?
+  # # Specialize to singleton `if`s
+  # singleton = len(out_types) == 1
+  # if singleton:
+  #   out_types = out_types[0]
   if_op = scf.IfOp(pred, out_types, hasElse=True)
   lowering_context = ctx.lowering_context.replace(
       block_shapes=ctx.block_shapes[1:],
   )
   with ir.InsertionPoint(if_op.then_block):
-    out = jaxpr_subcomp(lowering_context, branches[1].jaxpr, *args)
+    if len(branches) > 2:
+      out = _cond_lowering_rule(
+          ctx,
+          arith.SubIOp(index, ir_constant(1, index.type)).result,
+          *args,
+          branches=branches[1:],
+          linear=linear,
+      )
+    else:
+      out = jaxpr_subcomp(lowering_context, branches[1].jaxpr, *args)
     scf.YieldOp(out)
   with ir.InsertionPoint(if_op.else_block):
     out = jaxpr_subcomp(lowering_context, branches[0].jaxpr, *args)
     scf.YieldOp(out)
-  if singleton:
-    return if_op.result
+  # DO NOT SUBMIT
+  # if singleton:
+  #   return if_op.result
   return if_op.results
 
 
