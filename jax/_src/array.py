@@ -386,6 +386,7 @@ class ArrayImpl(basearray.Array):
     if self.platform() == "cpu":
       return DLDeviceType.kDLCPU, 0
 
+    # TODO(phawkins): remove the "gpu" case after jaxlib 0.4.16 is the minimum
     elif self.platform() == "gpu":
       platform_version = self.device().client.platform_version
       if "cuda" in platform_version:
@@ -401,7 +402,20 @@ class ArrayImpl(basearray.Array):
         raise ValueError("Couldn't get local_hardware_id for __dlpack__")
 
       return dl_device_type, local_hardware_id
+    elif self.platform() == "cuda":
+      dl_device_type = DLDeviceType.kDLCUDA
+      local_hardware_id = self.device().local_hardware_id
+      if local_hardware_id is None:
+        raise ValueError("Couldn't get local_hardware_id for __dlpack__")
 
+      return dl_device_type, local_hardware_id
+    elif self.platform() == "rocm":
+      dl_device_type = DLDeviceType.kDLROCM
+      local_hardware_id = self.device().local_hardware_id
+      if local_hardware_id is None:
+        raise ValueError("Couldn't get local_hardware_id for __dlpack__")
+
+      return dl_device_type, local_hardware_id
     else:
       raise ValueError(
           "__dlpack__ device only supported for CPU and GPU, got platform: "
