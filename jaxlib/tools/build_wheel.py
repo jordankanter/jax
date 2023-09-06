@@ -160,6 +160,7 @@ def prepare_wheel(sources_path, *, cpu):
   write_setup_cfg(sources_path, cpu)
   copy_to_jaxlib("__main__/jaxlib/init.py", dst_filename="__init__.py")
   copy_to_jaxlib(f"__main__/jaxlib/cpu_feature_guard.{pyext}")
+  copy_to_jaxlib(f"__main__/jaxlib/gpu_plugin_extension.{pyext}")
   copy_to_jaxlib(f"__main__/jaxlib/utils.{pyext}")
   copy_to_jaxlib("__main__/jaxlib/lapack.py")
   copy_to_jaxlib("__main__/jaxlib/hlo_helpers.py")

@@ -82,6 +82,11 @@ version = check_jaxlib_version(
 import jaxlib.cpu_feature_guard as cpu_feature_guard
 cpu_feature_guard.check_cpu_features()
 
+# TODO(jieying): remove after minimium jaxlib version is 0.4.15 or newer.
+try:
+  import jaxlib.gpu_plugin_extension as gpu_plugin_extension
+except ImportError:
+  gpu_plugin_extension = None
 import jaxlib.utils as utils
 import jaxlib.xla_client as xla_client
 import jaxlib.lapack as lapack

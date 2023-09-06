@@ -339,7 +339,7 @@ def register_plugin(
     priority: int = 400,
     library_path: Optional[str] = None,
     options: Optional[Mapping[str, Union[str, int, list[int], float]]] = None,
-) -> None:
+) -> Any:
   """Registers a backend factory for the PJRT plugin.
 
   Args:
@@ -351,15 +351,6 @@ def register_plugin(
     options: Optional. It is used when creating a PJRT plugin client.
   """
   def factory():
-    # Plugin may already be statically linked in some configurations, or we
-    # could be creating a client twice.
-    if not xla_client.pjrt_plugin_loaded(plugin_name):
-      if library_path is None:
-        raise ValueError(
-            'The library path is None when trying to dynamically load the'
-            ' plugin.'
-        )
-      xla_client.load_pjrt_plugin_dynamically(plugin_name, library_path)
     if xla_extension_version >= 183:
       if not xla_client.pjrt_plugin_initialized(plugin_name):
         xla_client.initialize_pjrt_plugin(plugin_name)
@@ -383,6 +374,12 @@ def register_plugin(
   experimental = plugin_name not in _nonexperimental_plugins
   register_backend_factory(plugin_name, factory, priority=priority,
                            fail_quietly=False, experimental=experimental)
+  if library_path is not None:
+    if xla_extension_version >= 195:
+      return xla_client.load_pjrt_plugin_dynamically(plugin_name, library_path)
+    else:
+      xla_client.load_pjrt_plugin_dynamically(plugin_name, library_path)
+  return None
 
 
 def register_pjrt_plugin_factories_from_env() -> None:

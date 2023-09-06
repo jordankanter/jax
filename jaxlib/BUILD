@@ -52,6 +52,7 @@ py_library_providing_imports_info(
     lib_rule = pytype_library,
     deps = [
         ":cpu_feature_guard",
+        ":gpu_plugin_extension",
         ":utils",
         "//jaxlib/cpu:_ducc_fft",
         "//jaxlib/cpu:_lapack",
@@ -178,6 +179,25 @@ pybind_extension(
         "@xla//third_party/python_runtime:headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:inlined_vector",
+        "@nanobind",
+    ],
+)
+
+pybind_extension(
+    name = "gpu_plugin_extension",
+    srcs = ["gpu_plugin_extension.cc"],
+    module_name = "gpu_plugin_extension",
+    deps = [
+        "@xla//third_party/python_runtime:headers",
+        "@xla//xla:status",
+        "@xla//xla:util",
+        "@xla//xla/pjrt:pjrt_api",
+        "@xla//xla/pjrt/c:pjrt_c_api_gpu_priv_hdrs",
+        "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
+        "@xla//xla/pjrt/c:pjrt_c_api_helpers",
+        "@xla//xla/python:status_casters",
+        "@tsl//tsl/platform:errors",
+        "@tsl//tsl/platform:statusor",
         "@nanobind",
     ],
 )

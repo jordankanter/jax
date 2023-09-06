@@ -39,6 +39,7 @@ py_library_providing_imports_info(
         "//jax:enable_jaxlib_build": [
             "//jaxlib",
             "//jaxlib:cpu_feature_guard",
+            "//jaxlib:gpu_plugin_extension",
             "//jaxlib:utils",
             "//jaxlib/mlir:arithmetic_dialect",
             "//jaxlib/mlir:builtin_dialect",
