@@ -281,9 +281,11 @@ class CompilationCacheTest(jtu.JaxTestCase):
         files_in_cache = len(os.listdir(tmpdir))
         self.assertEqual(files_in_cache, 1)
 
-  def test_cache_saving_metric(self):
+  # TODO(b/293308239) Remove this test for original cache savings after the new
+  # compilation cache key implementation is enabled.
+  def test_original_cache_saving_metric(self):
     with tempfile.TemporaryDirectory() as tmpdir, persistent_cache_min_compile_time_secs(
-        2):
+        2), use_original_compilation_cache_key_generation(True):
       cc.initialize_cache(tmpdir)
 
       durations = Counter()  # Map metric name to time duration.
@@ -315,20 +317,60 @@ class CompilationCacheTest(jtu.JaxTestCase):
             durations["/jax/compilation_cache/original_compile_time_saved_sec"],
             0)
 
-  def test_task_using_original_cache_metric(self):
+  # TODO(b/293308239) Remove the flag for original cache implementation after
+  # the new compilation cache key implementation is enabled.
+  def test_cache_saving_metric(self):
+    with tempfile.TemporaryDirectory() as tmpdir, persistent_cache_min_compile_time_secs(
+        2), use_original_compilation_cache_key_generation(False):
+      cc.initialize_cache(tmpdir)
+
+      durations = Counter()  # Map metric name to time duration.
+
+      def append_metric_duration(metric, duration):
+        durations[metric] += duration
+
+      with jtu.register_event_duration_listener(append_metric_duration):
+        # Mock time to create a short compilation time, no cache saved, no cache
+        # hit, no metric recorded.
+        with mock.patch("time.monotonic", side_effect=np.arange(0, 1, 0.1)):
+          jit(lambda x: x + 1)(1)
+
+        jit(lambda x: x + 1)(1)
+        self.assertNotIn(
+            "/jax/compilation_cache/compile_time_saved_sec", durations
+        )
+
+        # Mock time to create a long compilation time, metrics incremented with
+        # a cache hit.
+        with mock.patch("time.monotonic", side_effect=np.arange(0, 100, 10)):
+          jit(lambda x: x + 2)(1)
+
+        jit(lambda x: x + 2)(1)
+        self.assertGreater(
+            durations["/jax/compilation_cache/compile_time_saved_sec"], 0
+        )
+
+  # TODO(b/293308239) Modify this test to remove the logic for original cache
+  # adoption metric after the new compilation cache implementation is enabled.
+  def test_task_using_cache_metric(self):
     with tempfile.TemporaryDirectory() as tmpdir:
       cc.initialize_cache(tmpdir)
 
       jit(lambda x: x + 1)(1)
       self.assertEqual(
-          _counts["/jax/compilation_cache/tasks_using_original_cache"], 1)
-
+          _counts["/jax/compilation_cache/tasks_using_original_cache"]
+          ^ _counts["/jax/compilation_cache/tasks_using_cache"],
+          1,
+      )
       # Verify that the count is incremented only once per task.
       cc.reset_cache()
       cc.initialize_cache(tmpdir)
       jit(lambda x: x + 3)(3)
       self.assertEqual(
-          _counts["/jax/compilation_cache/tasks_using_original_cache"], 1)
+          _counts["/jax/compilation_cache/tasks_using_original_cache"]
+          ^ _counts["/jax/compilation_cache/tasks_using_cache"],
+          1,
+      )
 
   def test_compile_requests_use_cache_metric(self):
     previous_counts = Counter(_counts)
@@ -360,6 +402,8 @@ class CompilationCacheTest(jtu.JaxTestCase):
         - previous_counts["/jax/compilation_cache/cache_misses"],
         2)
 
+  # TODO(b/293308239) Remove this test for the original cache hits metric after
+  # the new compilation cache key implementation is enabled.
   def test_cache_hits_original_metric(self):
     previous_counts = Counter(_counts)
     with tempfile.TemporaryDirectory() as tmpdir, persistent_cache_min_compile_time_secs(
@@ -374,6 +418,24 @@ class CompilationCacheTest(jtu.JaxTestCase):
     self.assertEqual(
         _counts["/jax/compilation_cache/cache_hits_original"]
         - previous_counts["/jax/compilation_cache/cache_hits_original"],
+        1)
+
+  # TODO(b/293308239) Remove the flag for original cache implementation after
+  # the new compilation cache key implementation is enabled.
+  def test_cache_hits_metric(self):
+    previous_counts = Counter(_counts)
+    with tempfile.TemporaryDirectory() as tmpdir, persistent_cache_min_compile_time_secs(
+        2), use_original_compilation_cache_key_generation(False):
+      cc.initialize_cache(tmpdir)
+
+      # Mock time to create a long compilation time, cache saved.
+      with mock.patch("time.monotonic", side_effect=np.arange(0, 100, 10)):
+        jit(lambda x: x + 1)(1)
+      jit(lambda x: x + 1)(1)
+
+    self.assertEqual(
+        _counts["/jax/compilation_cache/cache_hits"]
+        - previous_counts["/jax/compilation_cache/cache_hits"],
         1)
 
 if __name__ == "__main__":
