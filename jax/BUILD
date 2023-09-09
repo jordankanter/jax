@@ -325,6 +325,10 @@ pytype_strict_library(
 pytype_strict_library(
     name = "config",
     srcs = ["_src/config.py"],
+    visibility = [
+        ":internal",
+        "//learning/deepmind/jax/ocean/runtime/python/_src:__pkg__",
+    ],
     deps = [
         ":logging_config",
         "//jax/_src/lib",

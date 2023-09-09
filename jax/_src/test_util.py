@@ -51,7 +51,8 @@ from jax._src import stages
 from jax._src.interpreters import pxla
 from jax._src.config import (bool_env, config,
                              raise_persistent_cache_errors,
-                             persistent_cache_min_compile_time_secs)
+                             persistent_cache_min_compile_time_secs,
+                             enable_jax_compilation_cache)
 from jax._src.numpy.util import promote_dtypes, promote_dtypes_inexact
 from jax._src.util import unzip2
 from jax._src.public_test_util import (  # noqa: F401
@@ -940,6 +941,7 @@ class JaxTestCase(parameterized.TestCase):
       stack = cls._compilation_cache_exit_stack
       stack.enter_context(raise_persistent_cache_errors(True))
       stack.enter_context(persistent_cache_min_compile_time_secs(0))
+      stack.enter_context(enable_jax_compilation_cache(True))
 
       tmp_dir = stack.enter_context(tempfile.TemporaryDirectory())
       compilation_cache.initialize_cache(tmp_dir)

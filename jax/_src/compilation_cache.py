@@ -27,6 +27,7 @@ except ImportError:
 from jax._src import path as pathlib
 from jax._src import cache_key
 from jax._src.compilation_cache_interface import CacheInterface
+from jax._src import config
 from jax._src.gfile_cache import GFileCache
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
@@ -37,7 +38,35 @@ logger = logging.getLogger(__name__)
 _cache: Optional[CacheInterface] = None
 
 
-def initialize_cache(path):
+def get_repository_path() -> Optional[str]:
+  """The default repository path if initialize_cache() has not been called
+  but the cache is enabled.
+  """
+  return None
+
+
+def _cache_enabled() -> bool:
+  """The cache is enabled only if the following conditions are satisfied:
+  1. config.enable_jax_compilation_cache is True.
+  2. Either a path was specified in a call to initialize_cache() or the
+     default path was successfully set.
+  """
+  if not config.enable_jax_compilation_cache:
+    return False
+
+  # Cache was initialized with a call to initialize_cache() or the default path.
+  if _cache is not None:
+    return True
+
+  # Try to initialize the cache with the default path.
+  default_path: Optional[str] = get_repository_path()
+  if default_path is None:
+    return False
+  initialize_cache(default_path)
+  return True
+
+
+def initialize_cache(path) -> None:
   """Creates a global cache object.
 
   Should only be called once per process.
@@ -65,6 +94,8 @@ def get_executable_and_time(
   """Returns the cached executable and its compilation time if present, or None
   otherwise.
   """
+  if not _cache_enabled():
+    return None, None
   assert _cache is not None, (
       "initialize_cache must be called before you can call"
       " get_executable_and_time()"
@@ -94,6 +125,8 @@ def put_executable_and_time(
   """Adds the 'executable' and its compilation time to the cache repository,
   possibly evicting older entries.
   """
+  if not _cache_enabled():
+    return
   assert _cache is not None, (
       "initialize_cache must be called before you can call"
       "put_executable_and_time()"
@@ -121,14 +154,15 @@ def get_cache_key(module: ir.Module, devices: np.ndarray, compile_options,
                        produce_original_cache_key)
 
 
-def is_initialized():
-  return _cache is not None
+def is_initialized() -> bool:
+  return _cache_enabled() and _cache is not None
 
 
-def reset_cache():
+def reset_cache() -> None:
   global _cache
   assert is_initialized()
-  logger.info("Resetting cache at %s.", _cache._path)
+  logger.info("Resetting cache at %s.",
+              _cache._path if _cache is not None else "<empty>")
   _cache = None
 
 

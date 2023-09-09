@@ -62,6 +62,7 @@ def increment_event_count(event):
 
 
 @jtu.with_config(
+    enable_jax_compilation_cache=True,
     jax_raise_persistent_cache_errors=True,
     jax_persistent_cache_min_compile_time_secs=0,
 )
