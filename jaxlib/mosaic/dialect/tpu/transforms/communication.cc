@@ -75,8 +75,13 @@ namespace {
 
 template <typename Op>
 void logicalToPhysicalDeviceIds(Op op, Value device_assignment) {
+  auto device_id_type =
+      op.getDeviceIdType().value_or(tpu::DeviceIdType::logical);
   auto device_id = op.getDeviceIdMutable();
   if (device_id.empty()) {
+    return;
+  }
+  if (device_id_type == tpu::DeviceIdType::physical) {
     return;
   }
   CHECK_EQ(device_id.size(), 1);

@@ -25,6 +25,7 @@ from jax import tree_util
 from jax._src import custom_derivatives
 from jax._src import debugging
 from jax._src import linear_util as lu
+from jax._src import mesh as mesh_lib
 from jax._src import pjit
 from jax._src import source_info_util
 from jax._src import state
@@ -68,12 +69,20 @@ zip, unsafe_zip = safe_zip, zip  # pylint: disable=redefined-builtin
 
 
 @dataclasses.dataclass
+class MeshContext:
+  mesh_to_physical: ir.Value
+  physical_to_mesh: ir.Value
+  axis_names: tuple[str, ...]
+
+
+@dataclasses.dataclass
 class LoweringContext:
   ir_context: ir.Context
   grid_mapping: core.GridMapping | None
   grid_indices: Sequence[ir.Value] | None
   block_shapes: list[tuple[int | core.Mapped, ...]]
   name_stack: source_info_util.NameStack
+  mesh_context: MeshContext | None
   replace = dataclasses.replace
 
 
@@ -143,21 +152,43 @@ def lower_jaxpr_to_module(
     grid_mapping: core.GridMapping,
     jaxpr: jax_core.Jaxpr,
     dimension_semantics: tuple[str | None, ...] | None,
+    mesh: mesh_lib.Mesh | None = None
 ) -> ir.Module:
   m = ir.Module.create()
   sym_tab = ir.SymbolTable(m.operation)
+  used_axis_names = jax_core.used_axis_names_jaxpr(jaxpr)
+  mesh_info = None
+  if used_axis_names:
+    axis_names = list(used_axis_names)
+    if mesh is None:
+      raise ValueError("Cannot use axis names in pallas_call without shard_map."
+                       )
+    mesh_to_physical = np.empty(mesh.device_ids.shape, dtype=np.int32)
+    physical_to_mesh = np.empty((mesh.size, len(axis_names)), dtype=np.int32)
+    for idx in np.ndindex(*mesh.device_ids.shape):
+      dev = mesh.device_ids[idx]
+      mesh_to_physical[idx] = dev
+      physical_to_mesh[dev] = np.array(idx)
+    mesh_info = (mesh_to_physical, physical_to_mesh, tuple(axis_names))
+  if mesh_info is None:
+    extra_args = ()
+  else:
+    physical_to_mesh, mesh_to_physical, _ = mesh_info
+    extra_args = (physical_to_mesh, mesh_to_physical)
   if not grid_mapping.grid:
     # Trivial grid-map, we don't need to populate the transform functions.
     func_op = lower_jaxpr_to_func(ctx, jaxpr, grid_mapping=grid_mapping,
-                                  name="main")
+                                  name="main", mesh_info=mesh_info)
     m.body.append(func_op)
     sym_tab.insert(func_op)
-    return m
+    return m, extra_args
   func_op = lower_jaxpr_to_func(ctx, jaxpr, grid_mapping=grid_mapping,
-                                name="main")
+                                name="main", mesh_info=mesh_info)
   m.body.append(func_op)
   sym_tab.insert(func_op)
   num_smem_inputs = grid_mapping.num_index_operands
+  if mesh_info:
+    num_smem_inputs += 2
   window_params = []
   grid = grid_mapping.grid
   for i, bm in enumerate(grid_mapping.block_mappings):
@@ -214,7 +245,7 @@ def lower_jaxpr_to_module(
   func_op.attributes["dimension_semantics"] = ir.ArrayAttr.get(
       map(ir.Attribute.parse, func_dimension_semantics)
   )
-  return m
+  return m, extra_args
 
 
 def lower_jaxpr_to_transform_func(
@@ -224,7 +255,8 @@ def lower_jaxpr_to_transform_func(
   arg_types = [*map(aval_to_ir_type, [invar.aval for invar in jaxpr.invars],
                     block_shapes, memspaces)]
   lowering_context = LoweringContext(
-      ctx, None, None, block_shapes, source_info_util.NameStack())
+      ctx, None, None, block_shapes, source_info_util.NameStack(),
+      mesh_context=None)
   body_func = functools.partial(jaxpr_subcomp, lowering_context, jaxpr)
   body_func.__name__ = name
   body = func.FuncOp.from_py_func(*arg_types, name=name)(body_func)
@@ -255,6 +287,7 @@ def lower_jaxpr_to_func(
     *,
     grid_mapping: core.GridMapping | None,
     name: str,
+    mesh_info: Any,
 ) -> func.FuncOp:
   memory_spaces = [None if bm is None else bm.memory_space
                    for bm in grid_mapping.block_mappings]
@@ -275,10 +308,20 @@ def lower_jaxpr_to_func(
     )
     return (aval_to_ir_type(aval, shape=shape, memory_space=memory_space),
             block_mapping.block_shape)
+
+  scalar_prefetch = grid_mapping.num_index_operands if grid_mapping else 0
+  if mesh_info is not None:
+    p_to_l, l_to_p, axis_names = mesh_info
+    p_to_l_aval = state.AbstractRef(
+        jax_core.raise_to_shaped(jax_core.get_aval(p_to_l)))
+    l_to_p_aval = state.AbstractRef(
+        jax_core.raise_to_shaped(jax_core.get_aval(l_to_p)))
+    arg_types = [_get_arg_type(p_to_l_aval, None, SMEM)[0],
+                 _get_arg_type(l_to_p_aval, None, SMEM)[0]]
+
   if grid_mapping is None:
     block_mappings = [None] * len(jaxpr.invars)
   else:
-    scalar_prefetch = grid_mapping.num_index_operands
     block_mappings = grid_mapping.block_mappings
     block_mappings = [*[None] * scalar_prefetch, *block_mappings]
     memory_spaces = [*[SMEM] * scalar_prefetch, *memory_spaces]
@@ -298,12 +341,18 @@ def lower_jaxpr_to_func(
           for i, g in enumerate(grid_indices)
           if i not in grid_mapping.mapped_dims
       ]
+      if mesh_info is not None:
+        (l_to_p, p_to_l), args = split_list(args, [2])
+        mesh_context = MeshContext(l_to_p, p_to_l, axis_names)
+      else:
+        mesh_context = None
       lowering_context = LoweringContext(
           ctx,
           grid_mapping,
           tuple(grid_indices),
           block_shapes,
           source_info_util.NameStack(),
+          mesh_context=mesh_context,
       )
       return jaxpr_subcomp(lowering_context, jaxpr, *args)
 
@@ -1428,13 +1477,36 @@ def _run_scoped_lowering_rule(ctx: LoweringRuleContext, *consts, jaxpr):
 
 lowering_rules[tpu_primitives.run_scoped_p] = _run_scoped_lowering_rule
 
+def _device_id_to_physical(
+    ctx, device_id, device_id_type: tpu_primitives.DeviceIdType):
+  if device_id_type is tpu_primitives.DeviceIdType.MESH:
+    device_id = map(_make_index, tree_util.tree_leaves(device_id))
+    m_to_p = ctx.lowering_context.mesh_context.mesh_to_physical
+    return memref.LoadOp(m_to_p, device_id).result
+  elif device_id_type is tpu_primitives.DeviceIdType.PHYSICAL:
+    return device_id
+  elif device_id_type is tpu_primitives.DeviceIdType.LOGICAL:
+    return device_id
+  else:
+    raise NotImplementedError(f"Unsupported device id type: {device_id_type}")
+
+def _device_id_type_to_tpu_type(device_id_type: tpu_primitives.DeviceIdType):
+  if (device_id_type == tpu_primitives.DeviceIdType.PHYSICAL or
+      device_id_type == tpu_primitives.DeviceIdType.MESH):
+    return ir.Attribute.parse("#tpu.device_id_type<physical>")
+  return ir.Attribute.parse("#tpu.device_id_type<logical>")
+
 def _semaphore_signal_lowering_rule(ctx: LoweringRuleContext, semaphore,
-                                    value, *args, has_device_id: bool):
+                                    value, *args, has_device_id: bool,
+                                    device_id_type: tpu_primitives.DeviceIdType):
   device_id = None
   assert semaphore.type == ir.Type.parse("!tpu.semaphore")
   if has_device_id:
     (device_id,) = args
-  return tpu.SemaphoreSignalOp(semaphore, value, device_id=device_id).results
+    device_id = _device_id_to_physical(ctx, device_id, device_id_type)
+  op = tpu.SemaphoreSignalOp(semaphore, value, device_id=device_id)
+  op.attributes["device_id_type"] = _device_id_type_to_tpu_type(device_id_type)
+  return op.results
 lowering_rules[tpu_primitives.semaphore_signal_p] = (
     _semaphore_signal_lowering_rule)
 
@@ -1459,12 +1531,11 @@ def _indexer_to_start_size(indexer: NDIndexer):
       partial(_ensure_mlir_value, aval=jax_core.ShapedArray((), jnp.int32)),
       starts,
   )
-  sizes = [
-      s.size if isinstance(s, primitives.Slice) else 1 for s in indexer.indices
-  ]
+  sizes = indexer.get_indexer_shape()
   return starts, sizes
 
-def _dma_start_lowering_rule(ctx: LoweringRuleContext, *args, tree):
+def _dma_start_lowering_rule(ctx: LoweringRuleContext, *args, tree,
+                             device_id_type: tpu_primitives.DeviceIdType):
   (src_ref, src_idx, dst_ref, dst_idx, sem, src_sem, device_id) = (
       tree_util.tree_unflatten(tree, args)
   )
@@ -1479,13 +1550,18 @@ def _dma_start_lowering_rule(ctx: LoweringRuleContext, *args, tree):
       memory_space=dst_ref.type.memory_space)
   src = tpu.MemRefSliceOp(src_ref_ty, src_ref, src_starts).result
   dst = tpu.MemRefSliceOp(dst_ref_ty, dst_ref, dst_starts).result
-  return tpu.EnqueueDMAOp(source=src, target=dst, target_semaphore=sem,
-                          source_semaphore=src_sem,
-                          device_id=device_id).results
+  if device_id is not None:
+    device_id = _device_id_to_physical(ctx, device_id, device_id_type)
+  op = tpu.EnqueueDMAOp(src, dst, sem, source_semaphore=src_sem,
+                          device_id=device_id)
+  op.attributes["device_id_type"] = _device_id_type_to_tpu_type(device_id_type)
+  return op.results
 lowering_rules[tpu_primitives.dma_start_p] = _dma_start_lowering_rule
 
 
-def _dma_wait_lowering_rule(ctx: LoweringRuleContext, *args, tree):
+def _dma_wait_lowering_rule(ctx: LoweringRuleContext, *args, tree,
+                            device_id_type: tpu_primitives.DeviceIdType):
+  del device_id_type
   sem, ref, idx = tree_util.tree_unflatten(tree, args)
   starts, sizes = _indexer_to_start_size(idx)
   ref_ty = ir.MemRefType.get(
@@ -1498,3 +1574,11 @@ lowering_rules[tpu_primitives.dma_wait_p] = _dma_wait_lowering_rule
 def _device_id_lowering_rule(ctx: LoweringRuleContext):
   return tpu.DeviceIdOp().result
 lowering_rules[tpu_primitives.device_id_p] = _device_id_lowering_rule
+
+def _axis_index_rule(ctx: LoweringRuleContext, *, axis_name: str):
+  physical_id = _make_index(tpu.PhysicalDeviceIdOp().result)
+  p_to_m = ctx.lowering_context.mesh_context.physical_to_mesh
+  axis_names = ctx.lowering_context.mesh_context.axis_names
+  col = _make_index(axis_names.index(axis_name))
+  return memref.LoadOp(p_to_m, [physical_id, col]).result
+lowering_rules[lax.axis_index_p] = _axis_index_rule

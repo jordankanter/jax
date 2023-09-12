@@ -86,6 +86,19 @@ def TPU_ContractPrecisionEnum
     let assemblyFormat = "`<` $value `>`";
 }
 
+def TPU_DeviceIdType : I32EnumAttr<"DeviceIdType", "Device id type", [
+  I32EnumAttrCase<"logical", 0, "logical">,
+  I32EnumAttrCase<"physical", 1, "physical">
+]> {
+    let genSpecializedAttr = 0;
+    let cppNamespace = "::mlir::tpu";
+}
+
+def TPU_DeviceIdTypeEnum
+    : EnumAttr<TPU_Dialect, TPU_DeviceIdType, "device_id_type"> {
+    let assemblyFormat = "`<` $value `>`";
+}
+
 def TPU_TiledCase   : I32EnumAttrCase<"tiled", 0>;
 def TPU_LaneCase    : I32EnumAttrCase<"lanes", 1>;
 def TPU_SublaneCase : I32EnumAttrCase<"sublanes", 2>;
@@ -374,6 +387,12 @@ def TPU_DeviceIdOp : TPU_Op<"device_id", [Pure]> {
   let assemblyFormat = [{ attr-dict `:` type($result) }];
 }
 
+def TPU_PhysicalDeviceIdOp : TPU_Op<"physical_device_id", [Pure]> {
+  let arguments = (ins);
+  let results = (outs I32:$result);
+  let assemblyFormat = [{ attr-dict `:` type($result) }];
+}
+
 def TPU_SemaphoreWaitOp : TPU_Op<"sem_wait"> {
   let arguments = (ins
     TPU_SemaphoreType:$semaphore,
@@ -399,7 +418,8 @@ def TPU_SemaphoreSignalOp : TPU_Op<"sem_signal"> {
   let arguments = (ins
     TPU_SemaphoreType:$semaphore,
     I32:$amount,
-    Optional<I32>:$device_id
+    Optional<I32>:$device_id,
+    OptionalAttr<TPU_DeviceIdTypeEnum>:$device_id_type // For remote DMAs
   );
   let assemblyFormat = [{
     $semaphore `,` $amount (`,` $device_id^)? attr-dict
@@ -412,7 +432,8 @@ def TPU_EnqueueDMAOp : TPU_Op<"enqueue_dma", [SameVariadicOperandSize]> {
     Optional<TPU_DMASemaphoreType>:$source_semaphore, // For remote DMAs
     AnyMemRef:$target,
     TPU_DMASemaphoreType:$target_semaphore,
-    Optional<I32>:$device_id // For remote DMAs
+    Optional<I32>:$device_id, // For remote DMAs
+    OptionalAttr<TPU_DeviceIdTypeEnum>:$device_id_type // For remote DMAs
   );
 }
 
