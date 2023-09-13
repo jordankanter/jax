@@ -541,8 +541,49 @@ class VectorLayoutInferer {
     TPU_CHECK_OP(else_yield->getOperandTypes() == op->getResultTypes(),
                  "scf if results and else branch yield operands do not match");
 
-    // Use the in_layout of the yield op in the then branch as the in_layout of
-    // the yield op in the else branch and the if op.
+    // Check each layout of the yield in else branch and override the
+    // result_layout if the offset is less general. For example, if we yield
+    // offset (0, *) in then branch and offset (*, 0) in else branch, the result
+    // offset should be (0, 0).
+    auto is_compatible_offset = [](LayoutOffset o1, LayoutOffset o2) -> bool {
+      return o1 == std::nullopt || o2 == std::nullopt || o1 == o2;
+    };
+    for (int i = 0; i < else_yield->getNumOperands(); ++i) {
+      const auto &operand = else_yield->getOperand(i);
+      if (!isa<VectorType>(operand.getType())) {
+        continue;
+      }
+      auto layout = getLayout(operand);
+      CHECK(result_layout[i] && layout);
+      if (result_layout[i]->bitwidth() == layout->bitwidth() &&
+          result_layout[i]->tiling() == layout->tiling() &&
+          result_layout[i]->implicit_dim() == layout->implicit_dim()) {
+        LayoutOffsets offsets = result_layout[i]->offsets();
+        if (offsets == layout->offsets()) {
+          continue;
+        }
+        if (!is_compatible_offset(offsets[0], layout->offsets()[0])) {
+          // Major offsets do not match in then and else branches.
+          return failure();
+        }
+        if (!is_compatible_offset(offsets[1], layout->offsets()[1])) {
+          // Minor offsets do not match in then and else branches.
+          return failure();
+        }
+        if (offsets[0] == std::nullopt) {
+          offsets[0] = layout->offsets()[0];
+        }
+        if (offsets[1] == std::nullopt) {
+          offsets[1] = layout->offsets()[1];
+        }
+        result_layout[i] =
+            VectorLayout(layout->bitwidth(), offsets, layout->tiling(),
+                         layout->implicit_dim());
+      } else {
+        return failure();
+      }
+    }
+
     setInLayout(then_yield, result_layout);
     setInLayout(else_yield, result_layout);
     setOutLayout(op, result_layout);
