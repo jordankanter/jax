@@ -160,6 +160,26 @@ def infer_block(block: ir.Block, hardware_generation: int):
             arg,
         )
         tpu.private_replace_all_uses_except(arg, erase_op.result, erase_op)
+    elif isinstance(op, tpu.ReinterpretCastOp):
+      arg = op.result
+      memref_ty = op.result.type
+      new_memref_ty = infer_memref(memref_ty, hardware_generation)
+      op.result.set_type(new_memref_ty)
+      if memref_ty != new_memref_ty:
+        if op_next is None:
+          ip = ir.InsertionPoint.at_block_end(block)
+        else:
+          ip = ir.InsertionPoint(op_next)
+        with ip:
+          erase_op = tpu.EraseLayoutOp(
+                ir.MemRefType.get(
+                    new_memref_ty.shape,
+                    memref_ty.element_type,
+                    None,
+                    new_memref_ty.memory_space),
+            arg,
+        )
+        tpu.private_replace_all_uses_except(arg, erase_op.result, erase_op)
     else:
       infer_op(op, hardware_generation)
 
