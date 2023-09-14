@@ -241,14 +241,13 @@ def _get_pjrt_plugin_names_and_library_paths(
 
 def _get_pjrt_plugin_config(
     json_path: str,
-) -> tuple[str, Optional[Mapping[str, Union[str, int, list[int], float]]]]:
+) -> tuple[str, Optional[xla_client.NameValueMapping]]:
   """Gets PJRT plugin configuration from a json file.
 
   The json file needs to have a "library_path" field for the plugin library
   path. It can have an optional "create_option" field for the options used when
   creating a PJRT plugin client. The value of "create_option" is key-value
-  pairs. Please see xla_client._NameValueMapping for the supported types of
-  values.
+  pairs.
   """
   with open(json_path) as f:
     config = json.load(f)
@@ -338,7 +337,7 @@ def register_plugin(
     *,
     priority: int = 400,
     library_path: Optional[str] = None,
-    options: Optional[Mapping[str, Union[str, int, list[int], float]]] = None,
+    options: Optional[xla_client.NameValueMapping] = None,
 ) -> None:
   """Registers a backend factory for the PJRT plugin.
 
@@ -376,7 +375,6 @@ def register_plugin(
         plugin_name, distribute_options, distributed.global_state.client
     )
 
-
   logger.debug(
       'registering PJRT plugin %s from %s', plugin_name, library_path
   )
@@ -394,7 +392,7 @@ def register_pjrt_plugin_factories_from_env() -> None:
   plugin configuration json file. The json file needs to have a "library_path"
   field for the plugin library path. It can have an optional "create_option"
   field for the options used when creating a PJRT plugin client. The value of
-  "create_option" is key-value pairs. Please see xla_client._NameValueMapping
+  "create_option" is key-value pairs. Please see xla_client.NameValueMapping
   for the supported types of values.
 
   TPU PJRT plugin will be loaded and registered separately in make_tpu_client.
